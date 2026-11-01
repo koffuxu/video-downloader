@@ -45,7 +45,7 @@ which yt-dlp ffmpeg aria2c 2>&1
 
 - B 站 → 必须提示用户"720P+ 需要登录态"
 - 小红书 → 必须确认 URL 含 `xsec_token`；`quality` 模式必须提示"4K 需要 Chrome 匿名 session cookie"
-- 抖音 / 快手 → `download.sh` 会自动委派到对应专用脚本，无需 Agent 操心
+- 抖音 / 快手 → `download.sh` 会自动委派到对应专用脚本，无需 Agent 操心。抖音走浏览器解析（首次会拉起 chromium，约 5-10 秒），只会给出**一个**档位（页面播放源，通常无水印）
 - 微博 → `quality` 模式可能下到 300+ MB 大文件，提前告知
 
 ### Step 3：先探测，把档位给用户挑（**必须做**）
@@ -141,5 +141,6 @@ ps -p <PID> >/dev/null && echo RUNNING || echo DONE
 - `scripts/download.sh` —— 统一下载入口（自动平台识别 + 多线程 + 自动委派抖音 / 快手）
 - `scripts/_probe_format_ytdlp.py` —— yt-dlp `-J` → 统一 probe JSON
 - `scripts/_probe_render_human.py` —— probe JSON → 人类表格
-- `scripts/download-douyin.sh` —— 抖音专用（绕开 yt-dlp 失效 extractor，走分享页 SSR）
+- `scripts/download-douyin.sh` —— 抖音专用（绕开 yt-dlp 失效 extractor，走**浏览器解析**：用真实浏览器让风控 JS 跑完，再取 `video.currentSrc` CDN 直链）
+- `scripts/douyin_browser_resolve.py` —— 抖音 URL → CDN 直链解析器（playwright chromium）
 - `scripts/download-kuaishou.sh` —— 快手专用（yt-dlp 无内置 extractor，走分享页 SSR）

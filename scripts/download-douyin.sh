@@ -6,17 +6,30 @@
 set -e
 
 # ===== --probe-only mode =====
+# In probe-only mode stdout must carry ONLY the JSON payload: probe.sh captures
+# it with $(...) and pipes it to the renderer. Every progress message therefore
+# goes to stderr, otherwise the JSON parse fails.
 PROBE_ONLY=0
 if [[ "${1:-}" == "--probe-only" ]]; then
   PROBE_ONLY=1
   shift
+  # From here on, stdout is reserved for the JSON result.
+  exec 3>&1 1>&2
 fi
 
 # ===== --ratio <value> mode (用户直接指定 ratio，用于显式 format 选择) =====
+# NOTE: --ratio consumes TWO slots (flag + value) so the remaining positional
+# args still line up as <mode> <url> [dir]. The browser resolver has no ratio
+# concept — "browser" is the format id it reports, so treat it as "use the
+# browser path" rather than as a ratio string.
 EXPLICIT_RATIO=""
 if [[ "${1:-}" == "--ratio" ]]; then
   EXPLICIT_RATIO="$2"
   shift 2
+  if [[ "$EXPLICIT_RATIO" == "browser" ]]; then
+    EXPLICIT_RATIO=""
+    MODE_OVERRIDE="browser"
+  fi
 fi
 
 MODE="${1:-compat}"
@@ -54,136 +67,249 @@ if [[ -z "$AWEME_ID" ]]; then
 fi
 
 if [[ -z "$AWEME_ID" ]]; then
-  echo "ERROR: cannot extract aweme_id from URL: $URL" >&2
-  exit 3
+  # Not fatal yet: the browser resolver handles short links itself (it follows
+  # the redirect and recovers the id from the final page URL). Only give up
+  # after that path has also failed.
+  echo "    aweme_id not resolvable from URL directly; browser resolver will handle it"
 fi
 
 echo "    aweme_id = $AWEME_ID"
 
-# --- Step 2: fetch SSR share page ---
-SHARE_URL="https://www.iesdouyin.com/share/video/${AWEME_ID}/"
-TMP_HTML="$(mktemp -t douyin_XXXXXX.html)"
-trap 'rm -f "$TMP_HTML"' EXIT
+# --- Step 2: resolve the media URL ---
+# Douyin moved the share page behind Argus/UIFID risk control (2026-11): the
+# SSR share page now returns ONLY anti-bot JS — no play_addr, no playApi, no
+# media URL — and yt-dlp's extractor answers "Fresh cookies ... are needed".
+# The working path is a real browser: let the page's JS mint the risk-control
+# cookies, then read video.currentSrc (the actual CDN url).
+# The legacy SSR parser is kept as a fallback for older/edge-case pages.
+BROWSER_RESOLVE="$(dirname "$0")/douyin_browser_resolve.py"
+PLAY_URL=""
+TITLE=""
+RESOLVER="browser"
 
-echo ">>> Fetching share page: $SHARE_URL"
-curl -sL -A "$UA_IOS" "$SHARE_URL" -o "$TMP_HTML"
-
-if [[ ! -s "$TMP_HTML" ]]; then
-  echo "ERROR: empty response from $SHARE_URL" >&2
-  exit 4
-fi
-
-# --- Step 3: extract title + play_addr URL ---
-TITLE="$(python3 -c "
-import re, sys, html
-data = open('$TMP_HTML', 'r', encoding='utf-8', errors='replace').read()
-m = re.search(r'<title[^>]*>([^<]+)</title>', data)
-if m:
-    t = html.unescape(m.group(1)).strip()
-    t = re.sub(r'[/\\\\:*?\"<>|]', '_', t)
-    t = t[:120]
-    print(t)
-" 2>/dev/null)"
-
-if [[ -z "$TITLE" ]]; then
-  TITLE="douyin_${AWEME_ID}"
-fi
-
-# Extract play_addr URL — prefer 'play' (no watermark) over 'playwm' if available
-PLAY_URL="$(python3 -c "
-import re, json, sys
-data = open('$TMP_HTML', 'r', encoding='utf-8', errors='replace').read()
-# raw play_addr block
-m = re.search(r'\"play_addr\"\s*:\s*\{([^}]+)\}', data)
-if not m:
-    sys.exit(1)
-block = m.group(1)
-urls = re.findall(r'https?[^\"]+', block)
-urls = [u.replace('\\\\u002F', '/').replace('\\\\/', '/') for u in urls]
-# Prefer non-watermark playwm -> play if possible
-preferred = None
-for u in urls:
-    if 'playwm' not in u and 'watermark' not in u:
-        preferred = u; break
-if not preferred:
-    preferred = urls[0] if urls else ''
-print(preferred)
-" 2>/dev/null)"
-
-if [[ -z "$PLAY_URL" ]]; then
-  echo "ERROR: cannot find play_addr in share page" >&2
-  echo "       (Douyin may have changed page structure; check $TMP_HTML)" >&2
-  exit 5
-fi
-
-# ===== --probe-only: emit JSON of available formats =====
-if [[ "$PROBE_ONLY" -eq 1 ]]; then
-  # 抖音 SSR 给出三档「逻辑画质」：通过修改 /play/?ratio= 实现
-  # 大小未知（API 不返回 Content-Length without HEAD），我们用 HEAD 探一下
-  PLAY_URL_BASE="${PLAY_URL//playwm/play}"
-  probe_size() {
-    local ratio="$1"
-    local u="$PLAY_URL_BASE"
-    if [[ "$u" == *"ratio="* ]]; then
-      u="$(echo "$u" | sed -E "s/ratio=[a-zA-Z0-9]+/ratio=${ratio}/")"
-    else
-      local sep="?"; [[ "$u" == *\?* ]] && sep="&"
-      u="${u}${sep}ratio=${ratio}"
+if [[ -f "$BROWSER_RESOLVE" ]] && command -v python3 >/dev/null 2>&1; then
+  echo ">>> Resolving via browser (risk-control JS runs in a real browser)..."
+  RESOLVE_JSON="$(python3 "$BROWSER_RESOLVE" "$URL" --json 2>/dev/null || true)"
+  if [[ -n "$RESOLVE_JSON" ]]; then
+    PLAY_URL="$(printf '%s' "$RESOLVE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("media_url",""))' 2>/dev/null)"
+    TITLE="$(printf '%s' "$RESOLVE_JSON" | python3 -c 'import json,sys,re; t=json.load(sys.stdin).get("title",""); print(re.sub(r"[/\\\\:*?\"<>|]","_",t)[:120])' 2>/dev/null)"
+    # The browser resolver follows short-link redirects and recovers the id from
+    # the final page URL — take it so later steps have a real aweme_id.
+    RESOLVED_ID="$(printf '%s' "$RESOLVE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("aweme_id","") or "")' 2>/dev/null)"
+    if [[ -n "$RESOLVED_ID" && -z "$AWEME_ID" ]]; then
+      AWEME_ID="$RESOLVED_ID"
+      echo "    aweme_id (from redirect) = $AWEME_ID"
     fi
-    curl -sI -A "$UA_IOS" --max-time 8 "$u" 2>/dev/null \
-      | awk -F': ' 'tolower($1)=="content-length" {print $2}' \
-      | tr -d '\r\n' | tail -1
-  }
-  SZ_720=$(probe_size 720p)
-  SZ_1080=$(probe_size 1080p)
-  SZ_DEF=$(probe_size default)
+  fi
+fi
 
-  python3 - "$AWEME_ID" "$TITLE" "$URL" "$SZ_720" "$SZ_1080" "$SZ_DEF" <<'PY'
-import sys, json
-aweme, title, url, s720, s1080, sdef = sys.argv[1:7]
-def to_int(x):
-    try: return int(x) if x else None
-    except: return None
-def human(n):
-    if not n: return None
-    n = float(n)
-    for u in ['B','KiB','MiB','GiB']:
-        if n < 1024: return f"{n:.1f} {u}"
-        n /= 1024
-def mk(ratio, label, note, sz):
-    s = to_int(sz)
-    return {
-        "id": f"ratio={ratio}",
-        "label": label,
-        "width": None, "height": None, "fps": None,
-        "vcodec": "h264" if ratio != "default" else "?",
-        "acodec": "aac",
-        "ext": "mp4",
-        "filesize": s,
-        "filesize_human": human(s),
-        "tbr": None,
-        "note": note,
-        "format_arg": ratio,  # download.sh 把这值传给 download-douyin.sh --ratio
-    }
-formats = [
-    mk("default", "原画 master", "上传者原始文件（可能 4K60 HEVC）", sdef),
-    mk("1080p",  "1080p",       "H.264 转码（任意播放器兼容）",     s1080),
-    mk("720p",   "720p",        "H.264 转码（体积最小）",           s720),
-]
+if [[ -n "$PLAY_URL" ]]; then
+  echo "    resolved media url via browser"
+  if [[ "$PROBE_ONLY" -eq 1 ]]; then
+    echo ">>> Probe-only: reporting the single rendition the page exposes"
+    python3 - "$AWEME_ID" "$TITLE" "$URL" "$PLAY_URL" 1>&3 <<'PY'
+import sys, json, urllib.request
+aweme, title, url, media = sys.argv[1:5]
+size = None
+try:
+    req = urllib.request.Request(media, method="HEAD", headers={
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+        "Referer": "https://www.douyin.com/",
+    })
+    with urllib.request.urlopen(req, timeout=12) as r:
+        size = int(r.headers.get("Content-Length") or 0) or None
+except Exception:
+    pass
 print(json.dumps({
     "platform": "douyin",
+    "id": aweme,
+    "title": title or f"douyin_{aweme}",
     "url": url,
-    "title": title,
-    "uploader": "",
-    "upload_date": "",
-    "duration": None,
-    "thumbnail": "",
-    "formats": formats,
+    "media_url": media,
+    "formats": [{
+        "id": "browser",
+        "label": "页面播放源（通常为无水印）",
+        "width": None, "height": None, "fps": None,
+        "vcodec": "h264", "acodec": "aac", "ext": "mp4",
+        "filesize": size, "filesize_approx": None,
+        "note": "由浏览器解析抖音风控后取得",
+    }],
 }, ensure_ascii=False, indent=2))
 PY
+    exit 0
+  fi
+  # Not probe-only: fall through to the browser download branch below.
+else
+    echo ">>> Browser resolve failed, falling back to legacy SSR share page..."
+    SHARE_URL="https://www.iesdouyin.com/share/video/${AWEME_ID}/"
+    TMP_HTML="$(mktemp -t douyin_XXXXXX.html)"
+    trap 'rm -f "$TMP_HTML"' EXIT
+
+    echo ">>> Fetching share page: $SHARE_URL"
+    curl -sL -A "$UA_IOS" "$SHARE_URL" -o "$TMP_HTML"
+
+  if [[ ! -s "$TMP_HTML" ]]; then
+    echo "ERROR: empty response from $SHARE_URL" >&2
+    exit 4
+  fi
+
+  # --- Step 3: extract title + play_addr URL ---
+  TITLE="$(python3 -c "
+  import re, sys, html
+  data = open('$TMP_HTML', 'r', encoding='utf-8', errors='replace').read()
+  m = re.search(r'<title[^>]*>([^<]+)</title>', data)
+  if m:
+      t = html.unescape(m.group(1)).strip()
+      t = re.sub(r'[/\\\\:*?\"<>|]', '_', t)
+      t = t[:120]
+      print(t)
+  " 2>/dev/null)"
+
+  if [[ -z "$TITLE" ]]; then
+    TITLE="douyin_${AWEME_ID}"
+  fi
+
+  # Extract play_addr URL — prefer 'play' (no watermark) over 'playwm' if available
+  PLAY_URL="$(python3 -c "
+  import re, json, sys
+  data = open('$TMP_HTML', 'r', encoding='utf-8', errors='replace').read()
+  # raw play_addr block
+  m = re.search(r'\"play_addr\"\s*:\s*\{([^}]+)\}', data)
+  if not m:
+      sys.exit(1)
+  block = m.group(1)
+  urls = re.findall(r'https?[^\"]+', block)
+  urls = [u.replace('\\\\u002F', '/').replace('\\\\/', '/') for u in urls]
+  # Prefer non-watermark playwm -> play if possible
+  preferred = None
+  for u in urls:
+      if 'playwm' not in u and 'watermark' not in u:
+          preferred = u; break
+  if not preferred:
+      preferred = urls[0] if urls else ''
+  print(preferred)
+  " 2>/dev/null)"
+
+  if [[ -z "$PLAY_URL" ]]; then
+    echo "ERROR: cannot find play_addr in share page" >&2
+    echo "       (Douyin may have changed page structure; check $TMP_HTML)" >&2
+    exit 5
+  fi
+
+  # ===== --probe-only: emit JSON of available formats =====
+  if [[ "$PROBE_ONLY" -eq 1 ]]; then
+    # 抖音 SSR 给出三档「逻辑画质」：通过修改 /play/?ratio= 实现
+    # 大小未知（API 不返回 Content-Length without HEAD），我们用 HEAD 探一下
+    PLAY_URL_BASE="${PLAY_URL//playwm/play}"
+    probe_size() {
+      local ratio="$1"
+      local u="$PLAY_URL_BASE"
+      if [[ "$u" == *"ratio="* ]]; then
+        u="$(echo "$u" | sed -E "s/ratio=[a-zA-Z0-9]+/ratio=${ratio}/")"
+      else
+        local sep="?"; [[ "$u" == *\?* ]] && sep="&"
+        u="${u}${sep}ratio=${ratio}"
+      fi
+      curl -sI -A "$UA_IOS" --max-time 8 "$u" 2>/dev/null \
+        | awk -F': ' 'tolower($1)=="content-length" {print $2}' \
+        | tr -d '\r\n' | tail -1
+    }
+    SZ_720=$(probe_size 720p)
+    SZ_1080=$(probe_size 1080p)
+    SZ_DEF=$(probe_size default)
+
+    python3 - "$AWEME_ID" "$TITLE" "$URL" "$SZ_720" "$SZ_1080" "$SZ_DEF" <<'PY'
+  import sys, json
+  aweme, title, url, s720, s1080, sdef = sys.argv[1:7]
+  def to_int(x):
+      try: return int(x) if x else None
+      except: return None
+  def human(n):
+      if not n: return None
+      n = float(n)
+      for u in ['B','KiB','MiB','GiB']:
+          if n < 1024: return f"{n:.1f} {u}"
+          n /= 1024
+  def mk(ratio, label, note, sz):
+      s = to_int(sz)
+      return {
+          "id": f"ratio={ratio}",
+          "label": label,
+          "width": None, "height": None, "fps": None,
+          "vcodec": "h264" if ratio != "default" else "?",
+          "acodec": "aac",
+          "ext": "mp4",
+          "filesize": s,
+          "filesize_human": human(s),
+          "tbr": None,
+          "note": note,
+          "format_arg": ratio,  # download.sh 把这值传给 download-douyin.sh --ratio
+      }
+  formats = [
+      mk("default", "原画 master", "上传者原始文件（可能 4K60 HEVC）", sdef),
+      mk("1080p",  "1080p",       "H.264 转码（任意播放器兼容）",     s1080),
+      mk("720p",   "720p",        "H.264 转码（体积最小）",           s720),
+  ]
+  print(json.dumps({
+      "platform": "douyin",
+      "url": url,
+      "title": title,
+      "uploader": "",
+      "upload_date": "",
+      "duration": None,
+      "thumbnail": "",
+      "formats": formats,
+  }, ensure_ascii=False, indent=2))
+PY
+    exit 0
+  fi
+
+fi
+
+# ===== Browser-resolved direct CDN url: download it as-is =====
+# When the browser resolver produced the url, it is already a concrete CDN
+# link to one rendition. Rewriting `ratio=` on it does nothing useful (the
+# param is not part of that URL's contract) and the URL is time-limited, so
+# download it verbatim with a Douyin referer.
+if [[ "$RESOLVER" == "browser" && -n "$PLAY_URL" ]]; then
+  OUT_FILE="$OUT_DIR/${TITLE:-douyin_${AWEME_ID}}.mp4"
+  echo "============================================"
+  echo " Douyin Downloader (browser-resolved)"
+  echo " title   : ${TITLE:-douyin_${AWEME_ID}}"
+  echo " out_file: $OUT_FILE"
+  echo "============================================"
+
+  echo ">>> Downloading media..."
+  # Use curl with an explicit Referer: the Douyin CDN requires it and aria2c
+  # has no option for a custom header (its -H is not a header flag).
+  curl -L -A "$UA_IOS" -e "https://www.douyin.com/" --retry 2 --retry-delay 1 \
+       -o "$OUT_FILE" "$PLAY_URL"
+  # If the CDN refused the file, retry without the referer before giving up.
+  if [[ ! -s "$OUT_FILE" ]] || [[ "$(stat -f%z "$OUT_FILE" 2>/dev/null || echo 0)" -lt 100000 ]]; then
+    echo ">>> Retry without referer..."
+    curl -L -A "$UA_IOS" -o "$OUT_FILE" "$PLAY_URL"
+  fi
+
+  echo ""
+  echo "============================================"
+  echo " Download complete."
+  echo "============================================"
+  if [[ -s "$OUT_FILE" ]]; then
+    echo " file : $OUT_FILE"
+    echo " size : $(ls -lh "$OUT_FILE" | awk '{print $5}')"
+    if command -v ffprobe >/dev/null 2>&1; then
+      echo " info :"
+      ffprobe -v error -show_entries stream=codec_name,codec_type,width,height \
+              -of default=noprint_wrappers=1 "$OUT_FILE" 2>/dev/null | sed 's/^/        /'
+    fi
+  else
+    echo " ERROR: output file empty" >&2
+    exit 6
+  fi
   exit 0
 fi
 
+# ===== Legacy path (browser resolve failed) =====
 # Mode handling — Douyin share API hidden tricks:
 #   /playwm/                    -> always 720p H.264 + watermark (ratio param ignored)
 #   /play/?ratio=720p|1080p     -> fixed-bitrate H.264 transcode (max 1080p)

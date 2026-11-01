@@ -98,7 +98,10 @@ if [[ "$PLATFORM" == "douyin" ]]; then
   DOUYIN_SCRIPT="$SCRIPT_DIR/download-douyin.sh"
   if [[ -x "$DOUYIN_SCRIPT" ]]; then
     echo ">>> Detected Douyin URL, delegating to download-douyin.sh"
-    if [[ -n "$FORMAT_OVERRIDE" ]]; then
+    # The browser resolver reports its rendition with format id "browser" and
+    # has no ratio concept — pass the mode straight through instead of
+    # smuggling the id into --ratio (which would shift the url/dir args).
+    if [[ -n "$FORMAT_OVERRIDE" && "$FORMAT_OVERRIDE" != "browser" ]]; then
       exec bash "$DOUYIN_SCRIPT" --ratio "$FORMAT_OVERRIDE" "$URL" "$OUT_DIR"
     fi
     exec bash "$DOUYIN_SCRIPT" "$MODE" "$URL" "$OUT_DIR"
@@ -205,7 +208,9 @@ cd "$OUT_DIR"
 PLATFORM_ARGS=()
 case "$PLATFORM" in
   youtube)
-    PLATFORM_ARGS+=(--extractor-args "youtube:player_client=ios,web_safari")
+    # The ios/web_safari clients YouTube retired — they answer "The page needs
+    # to be reloaded" and yt-dlp returns null. default,tv works.
+    PLATFORM_ARGS+=(--extractor-args "youtube:player_client=default,tv")
     ;;
   bilibili)
     # B 站 720P+ 必须登录，下面会尝试自动读取浏览器 cookies

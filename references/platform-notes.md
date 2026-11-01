@@ -34,19 +34,27 @@
 
 ## 抖音 (Douyin)
 
-- ⚠️ **yt-dlp 内置 extractor 自 2025 年起已失效**（需要复杂的 `a_bogus` 风控签名）
-- 本 skill 走 **移动端分享页 SSR 接口**：`https://www.iesdouyin.com/share/video/{aweme_id}/`
-- 流程：
-  1. 用户给的 URL（短链 `v.douyin.com/xxx` / 长链 `douyin.com/video/xxx`）→ 提取 `aweme_id`
-  2. 用 iOS UA 请求分享页 → 解析 HTML 中的 `play_addr` JSON
-  3. 优先尝试 `play`（无水印）版本，回退到 `playwm`（带水印）
-- **画质三档（通过隐藏的 `/play/?ratio=` 参数解锁）**：
-  - `speed` → `ratio=720p` → 720p H.264 转码，文件最小
-  - `compat` → `ratio=1080p` → 1080p H.264 转码，任意播放器兼容
-  - **`quality` → `ratio=default` → 原始 master 文件（上传者提供什么就下什么）**，实测可拿 **4K60 HEVC**——这是唯一拿 4K 的路径
-  - 关键隐藏机制：`/playwm/` 端点彻底忽略 ratio 参数只返 720p 水印版；`/play/` 端点才看 ratio；分享 URL 默认写死 `ratio=720p`，脚本会自动重写
-- 自动尝试无水印版本（把 URL 里的 `playwm` 换成 `play`，并改写 ratio 参数）
-- 不需要登录、不需要 cookies
+### 当前路径（2026-11 起）：浏览器解析
+
+抖音已全面接入 **Argus / UIFID 风控**：
+
+- 分享页 `https://www.iesdouyin.com/share/video/{aweme_id}/` 现在**只返回反爬 JS**，HTML 里没有 `play_addr`、没有 `playApi`、没有任何媒体 URL
+- 移动端接口直接回 `Blocked by ArgusSecurityPlugin Uifid Not Found`
+- yt-dlp 内置 extractor 回 `Fresh cookies (not necessarily logged in) are needed`（给 `ttwid`、`UIFID`、Chrome cookies 都无效）
+
+**唯一可行的解法是用真实浏览器**：`scripts/douyin_browser_resolve.py` 用 playwright chromium 打开视频页，等页面自身的风控 JS 跑完生成 cookie，然后读 `video.currentSrc` —— 那就是 CDN 直链（`douyinvod.com`），带 `Referer: https://www.douyin.com/` 直接 curl/aria2c 就能下。
+
+- 产出是**页面播放源**（通常无水印），单一档位，拿不到上传者的原始 4K master
+- 首次运行会拉起一次 chromium（约 5-10 秒）
+- `download-douyin.sh` 走这条路径；旧的 SSR 解析器保留为 fallback（应对极老页面）
+
+### 画质三档（旧路径，SSR 分享页仍可用时）
+
+- `speed` → `ratio=720p` → 720p H.264 转码，文件最小
+- `compat` → `ratio=1080p` → 1080p H.264 转码，任意播放器兼容
+- **`quality` → `ratio=default` → 原始 master 文件**，实测可拿 **4K60 HEVC**
+- 关键机制：`/playwm/` 忽略 ratio 参数只返 720p 水印版；`/play/` 才看 ratio
+
 
 ## 小红书 (Xiaohongshu / RedNote)
 
@@ -91,9 +99,9 @@
 | YouTube `Sign in to confirm you're not a bot` | 用 `--cookies-from-browser` |
 | B 站 `Format(s) 720P 准高清 are missing; you have to become a premium member` | **不是真要会员**，是要登录态。提示用户在浏览器登录 B 站后重试 |
 | B 站 `404 / 视频已失效` | 视频被删 / 下架 |
-| 抖音 `Fresh cookies (not necessarily logged in) are needed` | yt-dlp 内置 extractor 失效；本 skill 已自动改走 `download-douyin.sh` 绕开 |
+| 抖音 `Fresh cookies (not necessarily logged in) are needed` | yt-dlp 内置 extractor 已彻底失效（Argus/UIFID 风控）；本 skill 改走 `douyin_browser_resolve.py` 浏览器解析，yt-dlp 报的这条错误是**预期内**的，不代表技能坏了 |
 | 抖音 `cannot extract aweme_id` | URL 格式不识别，请用户检查链接是否完整 |
-| 抖音 `cannot find play_addr in share page` | 抖音分享页结构变了；可能需要更新脚本里的正则 |
+| 抖音 `cannot find play_addr in share page` | 抖音分享页已改版为只返回反爬 JS；正常情况下不会走到这条（浏览器解析会先成功），出现说明浏览器解析也失败了——检查 playwright/chromium 是否可用 |
 | `Video unavailable` / 地区限制 | 提示用户切换代理节点 |
 | `HTTP Error 403` | 等待几分钟重试，YouTube 可换 `tv_embedded` 客户端 |
 | Deno JS challenge 失败 | `brew upgrade yt-dlp` 或 `pip3 install -U yt-dlp` |

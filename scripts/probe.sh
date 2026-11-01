@@ -96,7 +96,9 @@ ensure_chrome_cookies() {
 
 # ---------- 委派到平台专用 probe ----------
 probe_douyin() {
-  bash "$SCRIPT_DIR/download-douyin.sh" --probe-only "$URL"
+  # download-douyin.sh takes <mode> <url> [dir]; --probe-only consumes the mode
+  # slot, so pass a placeholder mode before the url.
+  bash "$SCRIPT_DIR/download-douyin.sh" --probe-only compat "$URL"
 }
 probe_kuaishou() {
   bash "$SCRIPT_DIR/download-kuaishou.sh" --probe-only "$URL"
@@ -111,7 +113,9 @@ probe_ytdlp() {
   local extra_args=()
   case "$PLATFORM" in
     youtube)
-      extra_args+=(--extractor-args "youtube:player_client=ios,web_safari")
+      # NOTE: the ios/web_safari clients YouTube retired — they now answer
+      # "The page needs to be reloaded" and yt-dlp returns null. default,tv works.
+      extra_args+=(--extractor-args "youtube:player_client=default,tv")
       if [[ "${VDL_USE_CHROME:-}" == "1" ]]; then
         ensure_chrome_cookies
         extra_args+=("${PROBE_COOKIE_ARGS[@]}")
