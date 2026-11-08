@@ -45,7 +45,7 @@ which yt-dlp ffmpeg aria2c 2>&1
 
 - B 站 → 必须提示用户"720P+ 需要登录态"
 - 小红书 → 必须确认 URL 含 `xsec_token`；`quality` 模式必须提示"4K 需要 Chrome 匿名 session cookie"
-- 抖音 / 快手 → `download.sh` 会自动委派到对应专用脚本，无需 Agent 操心。抖音走浏览器解析（首次会拉起 chromium，约 5-10 秒），只会给出**一个**档位（页面播放源，通常无水印）
+- 抖音 / 快手 → `download.sh` 会自动委派到对应专用脚本，无需 Agent 操心。抖音走浏览器解析（首次会拉起 chromium，约 5-10 秒），会给出**多个**档位（不同分辨率，分带水印与无水印两族）
 - 微博 → `quality` 模式可能下到 300+ MB 大文件，提前告知
 
 ### Step 3：先探测，把档位给用户挑（**必须做**）
@@ -67,6 +67,13 @@ VDL_USE_CHROME=1 bash "<skill_directory>/scripts/probe.sh" --human "<URL>"
 把 probe 输出的档位表**直接展示给用户**，加一句推荐（兼容优先 = H.264 / 画质优先 = HEVC 或 AV1 / 速度优先 = 最低分辨率），然后问：
 
 > 你想下载哪一档？(回复行号，或输入 quality / compat / speed 用预设规则)。保存位置默认 `~/Downloads`，如需修改请告诉我目录。
+
+#### 抖音例外：不要问用户选档
+
+抖音的档位由平台风控决定，同一条作品能拿到 540×960 到 2160×3840 的多个候选，
+用户无从判断。**直接自动选最高清**（按分辨率排序，非水印优先），不要凑流程问用户。
+
+抖音首选 `scripts/douyin_fetch.py`（见下），它自带选档逻辑。
 
 ### Step 4：执行下载（按用户选择）
 
@@ -141,6 +148,8 @@ ps -p <PID> >/dev/null && echo RUNNING || echo DONE
 - `scripts/download.sh` —— 统一下载入口（自动平台识别 + 多线程 + 自动委派抖音 / 快手）
 - `scripts/_probe_format_ytdlp.py` —— yt-dlp `-J` → 统一 probe JSON
 - `scripts/_probe_render_human.py` —— probe JSON → 人类表格
-- `scripts/download-douyin.sh` —— 抖音专用（绕开 yt-dlp 失效 extractor，走**浏览器解析**：用真实浏览器让风控 JS 跑完，再取 `video.currentSrc` CDN 直链）
-- `scripts/douyin_browser_resolve.py` —— 抖音 URL → CDN 直链解析器（playwright chromium）
+- `scripts/download-douyin.sh` —— 抖音专用（旧路径：SSR 分享页 + 浏览器解析 `video.currentSrc`）。**播放器改用 MSE 流后 `currentSrc` 返回 blob 地址，此路已失效**，新下载请用 `douyin_fetch.py`
+- `scripts/douyin_fetch.py` —— **抖音下载首选**：拦截 `aweme/detail` 与播放器 CDN 请求取渐进式直链，探测各档分辨率后自动选最高清（非水印优先）。stdout 只出 JSON，进度走 stderr
+- `scripts/douyin_batch.sh` —— 批量下载多条抖音作品（并行，每条独立子目录避免临时文件名互相覆盖）
+- `scripts/douyin_browser_resolve.py` —— 旧解析器（读 `video.currentSrc`），MSE 播放器下返回 blob，仅作历史参考
 - `scripts/download-kuaishou.sh` —— 快手专用（yt-dlp 无内置 extractor，走分享页 SSR）
